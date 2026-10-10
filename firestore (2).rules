@@ -1,0 +1,123 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── HELPERS ──
+    function logueado() {
+      return request.auth != null;
+    }
+    function miUid() {
+      return request.auth.uid;
+    }
+    function miPerfil() {
+      return get(/databases/$(database)/documents/usuarios/$(miUid())).data;
+    }
+    function esAdmin() {
+      return logueado() && miPerfil().rol == "admin";
+    }
+    function esDueno(asesorId) {
+      return logueado() && asesorId == miUid();
+    }
+    // Verifica que solo se hayan cambiado los campos permitidos
+    function soloCambio(campos) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(campos);
+    }
+    // NUEVO: ¿soy el dueño del lead padre?
+    function duenoLead(leadId) {
+      return esDueno(get(/databases/$(database)/documents/leads/$(leadId)).data.asesorId);
+    }
+
+    // ── USUARIOS ──
+    match /usuarios/{userId} {
+      allow read: if logueado();
+
+      // Solo te puedes crear tu propio perfil, y siempre como "asesor"
+      allow create: if logueado()
+                    && userId == miUid()
+                    && request.resource.data.rol == "asesor"
+                    && request.resource.data.keys().hasAll(["nombre","email","rol"]);
+
+      // Un asesor solo puede tocar SU propio doc, y nunca su "rol" o "activo"
+      // CAMBIO: ahora también puede actualizar "ultimaConexion"
+      allow update: if esAdmin()
+                    || (userId == miUid() && soloCambio(["nombre","email","ultimaConexion"]));
+
+      allow delete: if esAdmin();
+    }
+
+    // ── LEADS ──
+    match /leads/{leadId} {
+      // La app pide la lista completa; el filtro "solo mis leads" lo hace el código
+      allow read: if logueado();
+
+      allow create: if esAdmin()
+                    || (logueado() && request.resource.data.asesorId == miUid());
+
+      allow update: if esAdmin()
+                    || (esDueno(resource.data.asesorId)
+                        && request.resource.data.asesorId == resource.data.asesorId);
+
+      allow delete: if esAdmin();
+
+      // Historial: hereda el dueño del lead padre
+      match /historial/{hId} {
+        allow read: if esAdmin() ||
+          esDueno(get(/databases/$(database)/documents/leads/$(leadId)).data.asesorId);
+
+        allow create: if esAdmin() ||
+          esDueno(get(/databases/$(database)/documents/leads/$(leadId)).data.asesorId);
+
+        // El historial es un log: nadie lo edita o borra, ni admin
+        allow update, delete: if false;
+      }
+
+      // NUEVO: tareas del cliente
+      match /tareas/{tId} {
+        allow read, create, update, delete: if esAdmin() || duenoLead(leadId);
+      }
+
+      // NUEVO: notas del cliente (incluye llamadas)
+      match /notas/{nId} {
+        allow read, create, delete: if esAdmin() || duenoLead(leadId);
+        allow update: if false;
+      }
+    }
+
+    // ── PROPIEDADES (catálogo) ──
+    match /propiedades/{propId} {
+      allow read: if logueado();
+      allow create, update, delete: if esAdmin();
+    }
+
+    // ── PUBLICACIONES ──
+    match /publicaciones/{pubId} {
+      allow read: if logueado();
+      allow create, delete: if esAdmin();
+      // Asesores solo pueden marcar como "publicado", nada más
+      allow update: if esAdmin()
+                    || (logueado() && soloCambio(["publicado","fechaPublicado"]));
+    }
+
+    // ── NOTIFICACIONES ──
+    match /notificaciones/{notifId} {
+      allow read: if esAdmin() || resource.data.paraUid == miUid();
+      allow create: if logueado();
+      // Solo se puede marcar como leída — nada más se puede tocar
+      allow update: if (esAdmin() || resource.data.paraUid == miUid())
+                    && soloCambio(["leida"]);
+      allow delete: if esAdmin();
+    }
+
+    // ── NUEVO: ACTIVIDAD del equipo (solo el jefe la lee) ──
+    match /actividad/{aId} {
+      allow read: if esAdmin();
+      allow create: if logueado() && request.resource.data.uid == miUid();
+      allow update, delete: if false;
+    }
+
+    // ── Bloqueo total a cualquier otra colección no contemplada ──
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
